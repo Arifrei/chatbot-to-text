@@ -9,3 +9,5 @@ MarkupSafe==3.0.2
 python-dotenv==1.1.1
 Werkzeug==3.1.3
 gunicorn
+openai~=1.97.1
+requests~=2.32.4
