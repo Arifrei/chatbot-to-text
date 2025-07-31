@@ -2,7 +2,7 @@ import os
 import json
 import sqlite3
 from dotenv import load_dotenv
-from flask import Flask, request
+from flask import Flask, request, render_template
 import requests
 from openai import OpenAI
 from sqlalchemy import create_engine, Column, String, Text
@@ -146,9 +146,9 @@ def groupme_webhook():
 def ping():
     return "<h1>Ping received. The site is now running.</h1>"
 
-@app.route("/how-to-use")
+@app.route("/consent")
 def instructions():
-    return f"<h2>Text the number provided to you to start the conversation. Text stop at any time to stop.</h2>"
+    return render_template("consent.html")
 
 if __name__ == "__main__":
     app.run(port=5000, debug=True)
