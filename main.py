@@ -146,5 +146,9 @@ def groupme_webhook():
 def ping():
     return "<h1>Ping received. The site is now running.</h1>"
 
+@app.route("/how-to-use")
+def instructions():
+    return f"<h2>Text the number provided to you to start the conversation. Text stop at any time to stop.</h2>"
+
 if __name__ == "__main__":
     app.run(port=5000, debug=True)
