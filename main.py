@@ -1,6 +1,8 @@
 import os
 import json
 import sqlite3
+from crypt import methods
+
 from dotenv import load_dotenv
 from flask import Flask, request, render_template
 import requests
@@ -146,8 +148,10 @@ def groupme_webhook():
 def ping():
     return "<h1>Ping received. The site is now running.</h1>"
 
-@app.route("/consent")
+@app.route("/consent", methods=["GET", "POST"])
 def instructions():
+    if request.method == "POST":
+        return "<h1>Thanks for your consent. You can now use the number provided to you to ask chatgpt anything!</h1>"
     return render_template("consent.html")
 
 if __name__ == "__main__":
