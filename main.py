@@ -1,7 +1,6 @@
 import os
 import json
 import sqlite3
-from crypt import methods
 
 from dotenv import load_dotenv
 from flask import Flask, request, render_template
