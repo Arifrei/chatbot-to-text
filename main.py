@@ -13,9 +13,9 @@ from sqlalchemy.exc import OperationalError, DBAPIError
 
 load_dotenv()
 
-GROUPME_BOT_ID = os.getenv("GROUPME_BOT_ID2")
+GROUPME_BOT_ID = os.getenv("GROUPME_BOT_ID")
 GROUPME_ACCESS_TOKEN = os.getenv("GROUPME_ACCESS_TOKEN")
-GROUPME_GROUP_ID = os.getenv("GROUPME_GROUP_ID2")
+GROUPME_GROUP_ID = os.getenv("GROUPME_GROUP_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "10"))
