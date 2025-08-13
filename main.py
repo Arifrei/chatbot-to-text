@@ -3,12 +3,10 @@ import json
 import time
 import threading
 import logging
-
 from dotenv import load_dotenv
 from flask import Flask, request, render_template_string
 import requests
 from openai import OpenAI
-
 from sqlalchemy import create_engine, Column, String, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.exc import OperationalError, DBAPIError
