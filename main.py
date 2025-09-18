@@ -3,22 +3,29 @@ import json
 import time
 import threading
 import logging
+import re
 from dotenv import load_dotenv
 from flask import Flask, request, render_template_string
 import requests
 from openai import OpenAI
-from sqlalchemy import create_engine, Column, String, Text
+from sqlalchemy import create_engine, Column, String, Text, Integer
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.exc import OperationalError, DBAPIError
 
 load_dotenv()
 
-GROUPME_BOT_ID = os.getenv("GROUPME_BOT_ID")
+GROUPME_BOT_ID = os.getenv("GROUPME_BOT_ID2")
 GROUPME_ACCESS_TOKEN = os.getenv("GROUPME_ACCESS_TOKEN")
-GROUPME_GROUP_ID = os.getenv("GROUPME_GROUP_ID")
+GROUPME_GROUP_ID = os.getenv("GROUPME_GROUP_ID2")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "10"))
+MAX_TOKENS_PER_REQUEST = int(os.getenv("MAX_TOKENS_PER_REQUEST", "2000"))
+SHORT_TERM_MESSAGES = int(os.getenv("SHORT_TERM_MESSAGES", "6"))
+MEMORY_TRIGGER_KEYWORDS = os.getenv("MEMORY_TRIGGER_KEYWORDS", "remember,recall,previous,before,earlier,mentioned,said,told").split(",")
+
+# Simple in-memory cache to prevent processing the same message twice
+processed_messages = set()
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("groupme-bot")
@@ -52,6 +59,45 @@ def init_db():
     Base.metadata.create_all(bind=engine)
 
 init_db()
+
+def estimate_tokens(text):
+    """Rough token estimation (1 token ≈ 4 characters for English)"""
+    return len(text) // 4
+
+def needs_memory_context(message):
+    """Check if message likely needs long-term memory context"""
+    message_lower = message.lower()
+    return any(keyword in message_lower for keyword in MEMORY_TRIGGER_KEYWORDS)
+
+def extract_relevant_memory(summary, current_message, max_tokens=150):
+    """Extract relevant parts of memory based on current message context"""
+    if not summary:
+        return ""
+    
+    # If message doesn't seem to need memory, return condensed version
+    if not needs_memory_context(current_message):
+        sentences = summary.split('. ')
+        condensed = '. '.join(sentences[:2])  # Just first 2 sentences
+        if estimate_tokens(condensed) <= max_tokens:
+            return condensed
+    
+    # For memory-relevant messages, return more context but still limit tokens
+    if estimate_tokens(summary) <= max_tokens:
+        return summary
+    
+    # Truncate if too long
+    words = summary.split()
+    truncated = []
+    token_count = 0
+    
+    for word in words:
+        word_tokens = estimate_tokens(word + " ")
+        if token_count + word_tokens > max_tokens:
+            break
+        truncated.append(word)
+        token_count += word_tokens
+    
+    return ' '.join(truncated) + "..." if len(truncated) < len(words) else ' '.join(truncated)
 
 def db_retry(fn):
     def wrapper(*args, **kwargs):
@@ -116,17 +162,21 @@ def summarize_history(history):
     messages = [m for m in history if m.get("role") != "system"]
     if not messages:
         return ""
-    prompt = "Summarize the following conversation and extract user preferences:\n" + \
-             "\n".join(f'{m["role"]}: {m["content"]}' for m in messages)
+    
+    # Create more focused prompt for concise summaries
+    recent_messages = messages[-10:]  # Only summarize recent messages
+    prompt = "Create a concise summary focusing on key facts, preferences, and context. Use bullet points:\n" + \
+             "\n".join(f'{m["role"]}: {m["content"]}' for m in recent_messages)
+    
     try:
         summary_response = client.chat.completions.create(
-            model="gpt-4",
+            model="gpt-4o-mini",  # Use cheaper model for summaries
             messages=[
-                {"role": "system", "content": "You summarize conversation context for long-term memory."},
+                {"role": "system", "content": "Create concise bullet-point summaries for chatbot memory. Focus on: user preferences, key facts, context, and important topics. Keep under 150 words."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=300,
-            temperature=0.3
+            max_tokens=200,  # Reduced from 300
+            temperature=0.1   # More focused summaries
         )
         return (summary_response.choices[0].message.content or "").strip()
     except Exception as e:
@@ -180,15 +230,86 @@ def groupme_fetch(after_id):
         logger.exception("GroupMe fetch exception: %s", e)
         return []
 
-def handle_incoming(user_id, sender_name, user_message):
+def build_context_messages(history, summary, user_message):
+    """Build context messages with token-efficient memory management"""
+    messages = []
+    
+    # Always include system prompt
+    system_prompt = "You are a helpful assistant responding in a GroupMe chat."
+    if not any(m.get("role") == "system" for m in history):
+        messages.append({"role": "system", "content": system_prompt})
+    
+    # Count non-system messages to determine conversation stage
+    user_messages = [m for m in history if m.get("role") == "user"]
+    message_count = len(user_messages)
+    
+    # Determine memory strategy
+    use_memory = False
+    memory_content = ""
+    
+    # Use memory if:
+    # 1. Message contains memory trigger keywords
+    # 2. Early in conversation (first 3 messages) and we have summary
+    # 3. Every 5th message for continuity
+    if summary:
+        if (needs_memory_context(user_message) or 
+            message_count <= 3 or 
+            message_count % 5 == 0):
+            use_memory = True
+            # Determine how much memory to include
+            if needs_memory_context(user_message):
+                memory_content = extract_relevant_memory(summary, user_message, max_tokens=200)
+            else:
+                memory_content = extract_relevant_memory(summary, user_message, max_tokens=100)
+    
+    if use_memory and memory_content:
+        messages.append({"role": "system", "content": f"Context about user: {memory_content}"})
+    
+    # Include recent conversation history
+    # Use fewer messages if we included memory to stay within token budget
+    history_limit = SHORT_TERM_MESSAGES if use_memory else SHORT_TERM_MESSAGES + 2
+    messages.extend(history[-history_limit:])
+    
+    return messages, use_memory
+
+def handle_incoming(user_id, sender_name, user_message, message_id=None):
+    # Debug logging
+    logger.info(f"Processing message from {sender_name} (ID: {message_id}): {user_message[:50]}...")
+    
+    # Deduplicate messages if we have a message ID
+    if message_id:
+        if message_id in processed_messages:
+            logger.info(f"✅ SKIPPING duplicate message {message_id}")
+            return
+        processed_messages.add(message_id)
+        logger.info(f"🆕 NEW message {message_id} added to cache")
+        # Keep cache size manageable (last 1000 messages)
+        if len(processed_messages) > 1000:
+            processed_messages.clear()
+    else:
+        logger.warning(f"⚠️ No message ID provided - cannot deduplicate")
     history, summary = get_user_convo(user_id)
+    
     if not any(m.get("role") == "system" for m in history):
         history.insert(0, {"role": "system", "content": "You are a helpful assistant responding in a GroupMe chat."})
+    
     history.append({"role": "user", "content": user_message})
-    messages = []
-    if summary:
-        messages.append({"role": "system", "content": f"Here is long-term memory about the user:\n{summary}"})
-    messages.extend(history[-25:])
+    
+    # Build context with token-efficient memory
+    messages, used_memory = build_context_messages(history, summary, user_message)
+    
+    # Estimate total tokens and warn if high
+    total_text = ' '.join([m.get('content', '') for m in messages])
+    estimated_tokens = estimate_tokens(total_text)
+    if estimated_tokens > MAX_TOKENS_PER_REQUEST:
+        logger.warning(f"High token usage estimated: {estimated_tokens} tokens for user {user_id}")
+    
+    # Log memory usage for debugging
+    if used_memory:
+        logger.info(f"Used memory context for user {user_id}: {estimate_tokens(messages[1]['content'] if len(messages) > 1 else '')} tokens")
+    else:
+        logger.info(f"No memory context used for user {user_id}")
+    
     reply_text = ai_reply(messages)
     history.append({"role": "assistant", "content": reply_text})
     save_user_convo(user_id, history, summary)
@@ -210,7 +331,7 @@ def groupme_webhook():
             _set_checkpoint(gid, mid)
         except Exception as e:
             logger.warning("Checkpoint bump failed (non-fatal): %s", e)
-    handle_incoming(user_id, sender_name, user_message)
+    handle_incoming(user_id, sender_name, user_message, mid)
     return "OK", 200
 
 @app.route("/ping", methods=["GET", "HEAD"])
@@ -259,7 +380,7 @@ def poll_for_missed_messages():
             text = m.get("text") or ""
             uid = m.get("user_id") or "unknown"
             name = m.get("name") or "User"
-            handle_incoming(uid, name, text)
+            handle_incoming(uid, name, text, msg_id)
             if msg_id:
                 _set_checkpoint(GROUPME_GROUP_ID, msg_id)
         last_id = msgs[-1].get("id") if msgs else last_id
@@ -277,7 +398,7 @@ def poll_for_missed_messages():
                 text = m.get("text") or ""
                 uid = m.get("user_id") or "unknown"
                 name = m.get("name") or "User"
-                handle_incoming(uid, name, text)
+                handle_incoming(uid, name, text, msg_id)
                 if msg_id:
                     _set_checkpoint(GROUPME_GROUP_ID, msg_id)
         except Exception as e:
@@ -285,8 +406,9 @@ def poll_for_missed_messages():
         time.sleep(POLL_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
-    is_reloader_child = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
-    if is_reloader_child or not app.debug:
-        threading.Thread(target=poll_for_missed_messages, daemon=True).start()
-        # logger.info("Background poller thread started.")
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True, use_reloader=True)
+    # Start polling thread (single process, no reloader confusion)
+    threading.Thread(target=poll_for_missed_messages, daemon=True).start()
+    logger.info("🔄 Background polling started (single process mode)")
+        
+    # Disable reloader to prevent duplicate processes
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True, use_reloader=False)
